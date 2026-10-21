@@ -1,9 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import {
-  InfoSuiteBridgeError,
-  invokeInfoSuite,
-  normalizeFunctionsBaseUrl,
-} from './bridge';
+import { InfoSuiteBridgeError, invokeInfoSuite, normalizeFunctionsBaseUrl } from './bridge';
 
 describe('InfoSuite bridge contract', () => {
   beforeEach(() => {
