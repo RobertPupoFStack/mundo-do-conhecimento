@@ -55,9 +55,7 @@ export function createInfoSuiteRequestId(): string {
   return `mdc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
 }
 
-const functionsBaseUrl = normalizeFunctionsBaseUrl(
-  import.meta.env.VITE_INFOSUITE_FUNCTIONS_URL,
-);
+const functionsBaseUrl = normalizeFunctionsBaseUrl(import.meta.env.VITE_INFOSUITE_FUNCTIONS_URL);
 
 export async function invokeInfoSuite<T>(
   functionName: 'launchSession' | 'studentRuntime',
