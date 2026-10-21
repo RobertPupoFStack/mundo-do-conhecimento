@@ -76,7 +76,15 @@ import { navigatorSaveData } from './render/sky';
 import { pathCrossesFence } from './sim/colliders';
 import { ABILITIES, CLASSES } from './sim/content/classes';
 import { findPlayerPath, resolvePlayerDestination } from './sim/pathfind';
-import { Sim } from './sim/sim';
+import { Sim, type CharacterState } from './sim/sim';
+import {
+  clearInfoSuiteTokens,
+  InfoSuiteBridgeError,
+  infoSuiteBridge,
+  readInfoSuiteTokens,
+  storeInfoSuiteTokens,
+  type InfoSuiteSessionState,
+} from './infosuite/bridge';
 import { TAB_NEAR_RADIUS, TAB_QUERY_RADIUS, tabConeHalfAt } from './sim/tab_target';
 import { DT, dist2d, INTERACT_RANGE, MELEE_RANGE, type PlayerClass, RUN_SPEED } from './sim/types';
 import { zoneBiomeAt } from './sim/world';
@@ -145,6 +153,24 @@ import { formatXp } from './ui/xp_bar';
 import type { IWorld, LeaderboardEntry } from './world_api';
 
 const WORLD_SEED = 20061; // fixed: World of ClaudeCraft is a persistent place
+const INFOSUITE_MODE = import.meta.env.VITE_INFOSUITE_MODE === '1';
+
+interface InfoSuiteRuntimeContext {
+  accessToken: string;
+  resumeToken: string;
+  sessionId: string;
+  state: InfoSuiteSessionState;
+  playerClass: PlayerClass;
+  displayName: string;
+  sim: Sim | null;
+  playerId: number | null;
+  lastSavedAt: number;
+  saveInFlight: Promise<void> | null;
+}
+
+let infoSuiteRuntime: InfoSuiteRuntimeContext | null = null;
+let infoSuiteAutosaveTimer: number | null = null;
+let infoSuiteSaveHooksInstalled = false;
 const CLICK_MOVE_TURN_RATE = 4.2; // rad/sec; responsive turning while the camera stays decoupled from click spam
 const CLICK_MOVE_WAYPOINT_STOP = 0.8; // yards; intermediate A* corners should roll through, not stutter-stop
 const CLICK_MOVE_REROUTE_DISTANCE = 4; // yards; live entity targets can move this far before we recompute the path
@@ -2290,6 +2316,299 @@ async function startOffline(playerClass: PlayerClass, name: string, skin = 0): P
   // Offline characters are not persisted (a fresh name is typed each session),
   // so the only stable handle is class + name. Keybinds scope to that pair.
   void startGame(sim, sim, null, `offline:${playerClass}:${name}`);
+}
+
+function isPlayerClass(value: unknown): value is PlayerClass {
+  return (
+    typeof value === 'string' &&
+    ['warrior', 'paladin', 'hunter', 'rogue', 'priest', 'shaman', 'mage', 'warlock', 'druid'].includes(value)
+  );
+}
+
+function getSavedCharacterState(state: InfoSuiteSessionState): CharacterState | null {
+  const snapshot = state.character.world_state?.character_state;
+  if (!snapshot || typeof snapshot !== 'object') return null;
+  if (
+    !Number.isInteger(snapshot.level) ||
+    snapshot.level < 1 ||
+    !snapshot.pos ||
+    !Number.isFinite(snapshot.pos.x) ||
+    !Number.isFinite(snapshot.pos.z) ||
+    !snapshot.equipment ||
+    !Array.isArray(snapshot.inventory) ||
+    !Array.isArray(snapshot.questLog) ||
+    !Array.isArray(snapshot.questsDone)
+  ) {
+    return null;
+  }
+  return snapshot;
+}
+
+function removeInfoSuiteTicketFromAddressBar(): void {
+  const url = new URL(window.location.href);
+  if (!url.searchParams.has('ticket')) return;
+  url.searchParams.delete('ticket');
+  history.replaceState(history.state, '', `${url.pathname}${url.search}${url.hash}`);
+}
+
+function ensureInfoSuiteModeStyles(): void {
+  if (document.getElementById('infosuite-mode-styles')) return;
+  const style = document.createElement('style');
+  style.id = 'infosuite-mode-styles';
+  style.textContent = `
+    body.infosuite-mode #start-screen-backdrop,
+    body.infosuite-mode #nav-btn-highscores,
+    body.infosuite-mode #nav-btn-wiki,
+    body.infosuite-mode #nav-btn-news,
+    body.infosuite-mode #nav-btn-download,
+    body.infosuite-mode #nav-btn-login,
+    body.infosuite-mode #nav-item-account,
+    body.infosuite-mode #nav-item-logout,
+    body.infosuite-mode #highscores-view,
+    body.infosuite-mode #news-view,
+    body.infosuite-mode #download-view,
+    body.infosuite-mode #account-view,
+    body.infosuite-mode #login-panel,
+    body.infosuite-mode #mode-select,
+    body.infosuite-mode #community-hud,
+    body.infosuite-mode #chat-input,
+    body.infosuite-mode #market-window,
+    body.infosuite-mode #social-window,
+    body.infosuite-mode #trade-window,
+    body.infosuite-mode #mm-social,
+    body.infosuite-mode #mobile-social,
+    body.infosuite-mode #mobile-chat,
+    body.infosuite-mode #btn-wallet,
+    body.infosuite-mode .cs-wallet,
+    body.infosuite-mode .wallet-cta,
+    body.infosuite-mode .community-links {
+      display: none !important;
+    }
+    body.infosuite-mode #infosuite-access-gate {
+      position: fixed; inset: 0; z-index: 100000; display: grid; place-items: center;
+      padding: 24px; background: #101521; color: #fff; font: 16px/1.5 system-ui, sans-serif;
+    }
+    body.infosuite-mode #infosuite-access-gate .infosuite-access-card {
+      width: min(520px, 100%); padding: 28px; border: 1px solid #475569;
+      border-radius: 18px; background: #182235; box-shadow: 0 24px 80px #0008;
+    }
+    body.infosuite-mode #infosuite-access-gate h1 { margin: 0 0 10px; font-size: 24px; }
+    body.infosuite-mode #infosuite-access-gate p { margin: 0 0 20px; color: #d4dbe7; }
+    body.infosuite-mode #infosuite-access-gate button {
+      padding: 10px 16px; border: 1px solid #94a3b8; border-radius: 10px;
+      background: #f8fafc; color: #0f172a; font-weight: 700; cursor: pointer;
+    }
+  `;
+  document.head.appendChild(style);
+}
+
+function showInfoSuiteAccessGate(message: string): void {
+  document.body.classList.add('infosuite-mode');
+  ensureInfoSuiteModeStyles();
+  document.getElementById('infosuite-access-gate')?.remove();
+
+  const gate = document.createElement('section');
+  gate.id = 'infosuite-access-gate';
+  gate.setAttribute('role', 'alert');
+  const card = document.createElement('div');
+  card.className = 'infosuite-access-card';
+  const title = document.createElement('h1');
+  title.textContent = 'Acesso ao Mundo do Conhecimento';
+  const description = document.createElement('p');
+  description.textContent = message;
+  const close = document.createElement('button');
+  close.type = 'button';
+  close.textContent = 'Voltar ao InfoSuite';
+  close.addEventListener('click', () => window.close());
+  card.append(title, description, close);
+  gate.append(card);
+  document.body.append(gate);
+}
+
+async function acquireInfoSuiteSession(): Promise<{
+  accessToken: string;
+  resumeToken: string;
+  state: InfoSuiteSessionState;
+}> {
+  const ticket = new URLSearchParams(window.location.search).get('ticket')?.trim() || '';
+  if (ticket) {
+    const launched = await infoSuiteBridge.launch(ticket);
+    storeInfoSuiteTokens(launched.access_token, launched.resume_token);
+    removeInfoSuiteTicketFromAddressBar();
+    return {
+      accessToken: launched.access_token,
+      resumeToken: launched.resume_token,
+      state: launched.session_state,
+    };
+  }
+
+  const stored = readInfoSuiteTokens();
+  if (stored.accessToken) {
+    try {
+      const state = await infoSuiteBridge.read(stored.accessToken);
+      if (state.session.status !== 'active') {
+        throw new InfoSuiteBridgeError('Esta sessão terminou. Abra novamente a missão pelo InfoSuite.', 409);
+      }
+      return { accessToken: stored.accessToken, resumeToken: stored.resumeToken, state };
+    } catch (error) {
+      if (!stored.resumeToken) throw error;
+    }
+  }
+
+  if (stored.resumeToken) {
+    const resumed = await infoSuiteBridge.resume(stored.resumeToken);
+    storeInfoSuiteTokens(resumed.access_token, resumed.resume_token);
+    return {
+      accessToken: resumed.access_token,
+      resumeToken: resumed.resume_token,
+      state: resumed.session_state,
+    };
+  }
+
+  throw new InfoSuiteBridgeError('Abra esta aventura pelo InfoSuite para validar seu acesso.', 401);
+}
+
+async function saveInfoSuiteCheckpoint(
+  reason: 'manual' | 'autosave' | 'exit' | 'quest' | 'milestone',
+  keepalive = false,
+): Promise<void> {
+  const runtime = infoSuiteRuntime;
+  if (!runtime?.sim || runtime.playerId === null) return;
+  if (runtime.saveInFlight) {
+    await runtime.saveInFlight;
+    return;
+  }
+
+  const snapshot = runtime.sim.serializeCharacter(runtime.playerId);
+  if (!snapshot) return;
+
+  const savePromise = infoSuiteBridge
+    .save(runtime.accessToken, snapshot, runtime.playerClass, reason, keepalive)
+    .then(() => {
+      runtime.lastSavedAt = Date.now();
+    })
+    .catch((error) => {
+      console.warn('[InfoSuite] checkpoint não confirmado; o próximo autosave tentará novamente.', error);
+    })
+    .finally(() => {
+      if (runtime.saveInFlight === savePromise) runtime.saveInFlight = null;
+    });
+  runtime.saveInFlight = savePromise;
+  await savePromise;
+}
+
+function installInfoSuiteSaveHooks(): void {
+  if (infoSuiteSaveHooksInstalled) return;
+  infoSuiteSaveHooksInstalled = true;
+  infoSuiteAutosaveTimer = window.setInterval(() => {
+    void saveInfoSuiteCheckpoint('autosave');
+  }, 30000);
+  window.addEventListener('pagehide', () => {
+    void saveInfoSuiteCheckpoint('exit', true);
+  });
+}
+
+async function startInfoSuiteWorld(
+  playerClass: PlayerClass,
+  name: string,
+  skin = 0,
+  savedState: CharacterState | null = null,
+): Promise<void> {
+  const runtime = infoSuiteRuntime;
+  if (!INFOSUITE_MODE || !runtime) return;
+  if (!(await prepareWorldEntry())) return;
+
+  audio.init();
+  music.init();
+  sfx.init();
+  const sim = new Sim({
+    seed: WORLD_SEED,
+    playerClass,
+    playerName: name,
+    noPlayer: true,
+    devCommands: false,
+  });
+  const playerId = sim.addPlayer(
+    playerClass,
+    name,
+    savedState ? { state: savedState } : {},
+  );
+  sim.setPlayerSkin(playerId, savedState?.skin ?? skin);
+
+  infoSuiteRuntime = {
+    ...runtime,
+    playerClass,
+    displayName: name,
+    sim,
+    playerId,
+    lastSavedAt: 0,
+    saveInFlight: null,
+  };
+
+  await startGame(sim, sim, null, `infosuite:${runtime.sessionId}`);
+  installInfoSuiteSaveHooks();
+  await saveInfoSuiteCheckpoint(savedState ? 'autosave' : 'milestone');
+}
+
+async function bootInfoSuiteMode(): Promise<void> {
+  document.body.classList.add('infosuite-mode');
+  ensureInfoSuiteModeStyles();
+  try {
+    try {
+      localStorage.setItem('locale', 'pt_BR');
+    } catch {
+      // Locale persistence is optional; the runtime can still use its fallback.
+    }
+
+    const session = await acquireInfoSuiteSession();
+    if (session.state.session.status !== 'active') {
+      throw new InfoSuiteBridgeError('A sessão não está ativa. Abra novamente a missão pelo InfoSuite.', 409);
+    }
+
+    const playerClass = isPlayerClass(session.state.character.rpg_attributes?.player_class)
+      ? session.state.character.rpg_attributes.player_class
+      : 'mage';
+    const displayName = sanitizeOfflineName(
+      session.state.player.display_name || 'Aventureiro',
+    );
+    infoSuiteRuntime = {
+      accessToken: session.accessToken,
+      resumeToken: session.resumeToken,
+      sessionId: session.state.session.id,
+      state: session.state,
+      playerClass,
+      displayName,
+      sim: null,
+      playerId: null,
+      lastSavedAt: 0,
+      saveInFlight: null,
+    };
+
+    wireStartScreens();
+    const nameInput = document.querySelector('#char-name') as HTMLInputElement | null;
+    if (nameInput) {
+      nameInput.value = displayName;
+      nameInput.readOnly = true;
+      nameInput.setAttribute('aria-readonly', 'true');
+    }
+
+    const savedState = getSavedCharacterState(session.state);
+    if (savedState) {
+      const startScreen = document.getElementById('start-screen');
+      if (startScreen) startScreen.style.display = 'none';
+      await startInfoSuiteWorld(playerClass, displayName, savedState.skin ?? 0, savedState);
+    }
+  } catch (error) {
+    try {
+      clearInfoSuiteTokens();
+    } catch {
+      // Storage may be unavailable in a restricted browser context.
+    }
+    const message = error instanceof Error
+      ? error.message
+      : 'Não foi possível validar a sessão. Abra novamente a missão pelo InfoSuite.';
+    showInfoSuiteAccessGate(message);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -5190,10 +5509,12 @@ function wireStartScreens(): void {
   };
   void ensureLocaleLoaded(bootLang).then(revealLocalized, revealLocalized);
   hydrateIcons();
-  void loadProjectStats();
-  wireContractAddressCopy();
-  wireHomepageMusicToggle();
-  wireWallet();
+  if (!INFOSUITE_MODE) {
+    void loadProjectStats();
+    wireContractAddressCopy();
+    wireHomepageMusicToggle();
+    wireWallet();
+  }
 
   // mode select
   const onlineBtn = $('#btn-online');
@@ -5256,7 +5577,14 @@ function wireStartScreens(): void {
     music.init();
     sfx.init();
     const name = sanitizeOfflineName(rawName);
-    void startOffline(cls, name, selectedSkin('#offline-skin-row', offlineSkin));
+    const skin = selectedSkin('#offline-skin-row', offlineSkin);
+    if (INFOSUITE_MODE) {
+      void startInfoSuiteWorld(cls, name, skin).catch((error) => {
+        showInfoSuiteAccessGate(error instanceof Error ? error.message : 'Não foi possível iniciar a aventura.');
+      });
+    } else {
+      void startOffline(cls, name, skin);
+    }
   };
 
   const handleOfflineSelect = () => {
@@ -5423,7 +5751,12 @@ function wireStartScreens(): void {
       else handleOnlineSelect();
     });
 
+    if (INFOSUITE_MODE) {
+    applyServerMode('offline');
+    handleOfflineSelect();
+  } else {
     applyServerMode('online');
+  }
   }
 
   btnStartOffline.addEventListener('click', () => {
@@ -6034,19 +6367,17 @@ function wireStartScreens(): void {
     void renderAccountPortal();
   });
   setupNavBtn($('#nav-btn-logout'), '#hero-view', logoutAccount);
-  trackCommunityLinkClicks();
-  setupAccountPortal();
-  // Restore a persisted session: show the Account tab immediately, then confirm
-  // the stored token is still valid against the server (clearing it if not).
-  if (api.restoreSession()) {
-    enterLoggedInChrome();
-    void revalidateAccountSession();
-    // Re-bind the account's linked wallet on a restored session (not just on fresh
-    // login), so an auto-reconnected wallet shows verified and is NOT treated as
-    // unverified and disconnected (the bug that forced a re-sign on every reload).
-    void refreshWalletLinkStatus();
-  } else {
-    enterLoggedOutChrome();
+  if (!INFOSUITE_MODE) {
+    trackCommunityLinkClicks();
+    setupAccountPortal();
+    // Restore a persisted public account session only in the original public build.
+    if (api.restoreSession()) {
+      enterLoggedInChrome();
+      void revalidateAccountSession();
+      void refreshWalletLinkStatus();
+    } else {
+      enterLoggedOutChrome();
+    }
   }
 
   // Header Logo click listener to return to homepage
@@ -6157,7 +6488,7 @@ function wireStartScreens(): void {
     }
   };
 
-  initBackgroundEmbers();
+  if (!INFOSUITE_MODE) initBackgroundEmbers();
 
   // Landing backdrop: read the persisted high-contrast preference and decide
   // trailer-vs-static (also forced static on phones / Save-Data / reduced-motion).
@@ -6171,7 +6502,7 @@ function wireStartScreens(): void {
     if (contrastToggle) contrastToggle.setAttribute('aria-pressed', String(on));
   };
   syncContrastToggle(landingSettings.get('landingHighContrast'));
-  applyLandingBackdrop(landingSettings.get('landingHighContrast'));
+  if (!INFOSUITE_MODE) applyLandingBackdrop(landingSettings.get('landingHighContrast'));
 
   // Stamp the engine/device + CSS-effects classes on the landing screen too, so
   // the decorative #start-screen-backdrop work (portal rings' heavy blur, nebula,
@@ -6284,6 +6615,10 @@ function fadeOutHomepageMusic(durationMs = 1600): void {
   }
 })();
 
-startSitePresence('home');
-wireStartScreens();
-initHomepageMusic();
+if (INFOSUITE_MODE) {
+  void bootInfoSuiteMode();
+} else {
+  startSitePresence('home');
+  wireStartScreens();
+  initHomepageMusic();
+}
